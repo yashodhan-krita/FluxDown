@@ -151,9 +151,16 @@ impl GatewayService {
         self
     }
 
+    /// 默认（非本机来源）调用：本机桌面集成一律不放行，等价于历史行为。
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn call(&self, request: RpcRequest) -> RpcResponse {
+        self.call_with(false, request).await
+    }
+
+    /// 与 [`Self::call`] 相同，但把「本机来源」判定透传给 [`Self::dispatch_with`]。
+    async fn call_with(&self, allow_local_platform: bool, request: RpcRequest) -> RpcResponse {
         let id = request.id.clone();
-        match self.dispatch(request).await {
+        match self.dispatch_with(request, allow_local_platform).await {
             Ok(value) => RpcResponse::success(id, value),
             Err(data) => {
                 RpcResponse::failure(id, RpcErrorObject::application("agent RPC failed", data))
@@ -176,8 +183,27 @@ impl GatewayService {
     }
 
     async fn dispatch(&self, request: RpcRequest) -> Result<serde_json::Value, RpcErrorData> {
+        self.dispatch_with(request, false).await
+    }
+
+    /// 与 [`Self::dispatch`] 相同，但可放行「仅字面本机」的桌面集成调用。
+    ///
+    /// `allow_local_platform` 只在一个「本机来源」的连接上为 `true`：对端是环回地址
+    /// （127.0.0.1/::1），或显式设置 `FLUXDOWN_ALLOW_LOCAL_PLATFORM=1`。用于让
+    /// **headless server 跑在同一台机器**（如桌面串流、本机 NAS）时，Web UI 也能
+    /// 「定位/打开文件」；不改变真正的远程部署语义——远程来源仍得 `Unsupported`。
+    async fn dispatch_with(
+        &self,
+        request: RpcRequest,
+        allow_local_platform: bool,
+    ) -> Result<serde_json::Value, RpcErrorData> {
         // 桌面专属集成（打开 / 定位文件、开机自启、文件与协议关联）在 headless 宿主不存在。
-        if self.server_mode && request.method.starts_with("agent.platform.") {
+        // 唯二例外：本机来源（环回/env 放行）的「打开任务 / 定位任务」——让同机 server 的
+        // Web UI 也能打开文件；远程来源与其余 platform.* 一律拒绝。
+        if self.server_mode
+            && request.method.starts_with("agent.platform.")
+            && !(allow_local_platform && local_platform_method_allowed(&request.method))
+        {
             return Err(RpcErrorData::new(ApplicationErrorCode::Unsupported, false));
         }
         if self.server_mode && server_mode_denies(&request) {
@@ -1581,6 +1607,9 @@ async fn rpc_upgrade(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    // 「本机来源」判定在建连时拍板：对端环回或显式 env 放行。桌面形态（无 server）
+    // 恒为 true——桌面本就在本机。
+    let allow_local_platform = state.server.is_none() || local_platform_permitted(peer.ip());
     let upgrade = match state.server.as_deref() {
         Some(server) => {
             if let Err(status) = server.authorize_rpc_from(peer.ip(), &headers, &state.bearer) {
@@ -1597,7 +1626,9 @@ async fn rpc_upgrade(
         }
     };
     upgrade
-        .on_upgrade(move |socket| run_socket(socket, state.service, state.cancel))
+        .on_upgrade(move |socket| {
+            run_socket(socket, state.service, state.cancel, allow_local_platform)
+        })
         .into_response()
 }
 
@@ -1605,6 +1636,7 @@ async fn run_socket(
     mut socket: WebSocket,
     service: Arc<GatewayService>,
     cancel: CancellationToken,
+    allow_local_platform: bool,
 ) {
     let mut ready = false;
     let mut ui_client = false;
@@ -1660,7 +1692,7 @@ async fn run_socket(
                             let (receiver, _) = service.events.subscribe_and_snapshot();
                             events = Some(receiver);
                             let (response_tx, response_rx) = tokio::sync::mpsc::channel(RESPONSE_QUEUE);
-                            lanes = Some(RequestLanes::spawn(&service, response_tx));
+                            lanes = Some(RequestLanes::spawn(&service, response_tx, allow_local_platform));
                             responses = Some(response_rx);
                             let result = match serde_json::to_value(&service.hello) {
                                 Ok(result) => result,
@@ -1755,6 +1787,40 @@ async fn receive_response(
 const RESPONSE_QUEUE: usize = 256;
 /// 每个通道待处理请求上限；超出立即以可重试的 `Unavailable` 拒绝，而不是阻塞整个连接。
 const LANE_QUEUE: usize = 128;
+
+/// 允许「本机来源」在 server 模式下调用的 `agent.platform.*` 子集。
+///
+/// 只放行「与本机文件系统交互、但无系统级副作用」的三个只读/打开动作。**不含**
+/// 自启 / 文件关联 / 协议注册 / `openPath` 之类可写注册表或任意路径的动作——那些仍
+/// 一律拒绝，即使来源是本机。
+fn local_platform_method_allowed(method: &str) -> bool {
+    matches!(
+        method,
+        fluxdown_protocol::method::AGENT_PLATFORM_OPEN_TASK
+            | fluxdown_protocol::method::AGENT_PLATFORM_REVEAL_TASK
+    )
+}
+
+/// 本连接是否可放行「仅字面本机」的桌面集成：对端为环回地址，或显式设置
+/// `FLUXDOWN_ALLOW_LOCAL_PLATFORM=1`（无人值守的本机部署可用）。
+fn local_platform_permitted(peer: std::net::IpAddr) -> bool {
+    peer.is_loopback() || env_flag(ENV_ALLOW_LOCAL_PLATFORM)
+}
+
+/// 显式放行「本机来源」桌面集成的环境变量（见 [`local_platform_permitted`]）。
+const ENV_ALLOW_LOCAL_PLATFORM: &str = "FLUXDOWN_ALLOW_LOCAL_PLATFORM";
+
+/// 简单布尔环境变量判定：`1` / `true` / `yes` / `on`（大小写不敏感）为真。
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
 
 /// headless 宿主不提供桌面集成：打开路径、写注册表 / 关联、请求管理员授权、打开系统设置与
 /// 测试通知的诊断动作，以及可写任意目标路径的日志导出。Web 的 Doctor 仍可用其余动作（刷新
@@ -1870,6 +1936,7 @@ impl RequestLanes {
     fn spawn(
         service: &Arc<GatewayService>,
         responses: tokio::sync::mpsc::Sender<RpcResponse>,
+        allow_local_platform: bool,
     ) -> Self {
         let mut tasks = tokio::task::JoinSet::new();
         let mut start = || {
@@ -1878,7 +1945,7 @@ impl RequestLanes {
             let responses = responses.clone();
             tasks.spawn(async move {
                 while let Some(request) = receiver.recv().await {
-                    let response = service.call(request).await;
+                    let response = service.call_with(allow_local_platform, request).await;
                     if responses.send(response).await.is_err() {
                         break;
                     }
@@ -1909,7 +1976,7 @@ impl RequestLanes {
                         let service = Arc::clone(&service);
                         let responses = responses.clone();
                         calls.spawn(async move {
-                            let response = service.call(request).await;
+                            let response = service.call_with(allow_local_platform, request).await;
                             if responses.send(response).await.is_err() {
                                 tracing::trace!("gateway connection closed before concurrent response");
                             }
@@ -2037,8 +2104,50 @@ mod tests {
 
     use super::{
         GatewayService, GatewayShell, Lane, authorized, ensure_exposed_auth_token, lane_for,
-        load_or_create_bearer,
+        load_or_create_bearer, local_platform_method_allowed, local_platform_permitted,
     };
+
+    #[test]
+    fn local_platform_gate_allows_only_open_and_reveal() {
+        use fluxdown_protocol::method;
+        assert!(local_platform_method_allowed(
+            method::AGENT_PLATFORM_OPEN_TASK
+        ));
+        assert!(local_platform_method_allowed(
+            method::AGENT_PLATFORM_REVEAL_TASK
+        ));
+        // 读写宿主机路径 / 系统集成一律不放行，即使本机来源。
+        assert!(!local_platform_method_allowed(
+            method::AGENT_PLATFORM_OPEN_PATH
+        ));
+        assert!(!local_platform_method_allowed(
+            method::AGENT_PLATFORM_SET_AUTOSTART
+        ));
+        assert!(!local_platform_method_allowed(
+            method::AGENT_PLATFORM_SET_FILE_ASSOCIATION
+        ));
+        assert!(!local_platform_method_allowed(
+            method::AGENT_PLATFORM_SET_URL_PROTOCOL
+        ));
+    }
+
+    #[test]
+    fn local_platform_permitted_only_for_loopback() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        // 环回放行。
+        assert!(local_platform_permitted(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(local_platform_permitted(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        // 非环回拒绝（前提：测试进程未设置放行 env）。
+        if std::env::var("FLUXDOWN_ALLOW_LOCAL_PLATFORM").is_err() {
+            assert!(!local_platform_permitted(IpAddr::V4(Ipv4Addr::new(
+                192, 168, 1, 10
+            ))));
+            assert!(!local_platform_permitted(IpAddr::V4(Ipv4Addr::new(
+                8, 8, 8, 8
+            ))));
+        }
+    }
+
     #[tokio::test]
     async fn service_bearer_is_exact_stable_and_private() {
         let dir = std::env::temp_dir().join(format!(
@@ -3507,7 +3616,7 @@ mod tests {
         });
         let service = Arc::new(harness.service);
         let (responses, mut receiver) = tokio::sync::mpsc::channel(4);
-        let lanes = super::RequestLanes::spawn(&service, responses);
+        let lanes = super::RequestLanes::spawn(&service, responses, false);
         assert!(
             lanes
                 .submit(RpcRequest::new(
